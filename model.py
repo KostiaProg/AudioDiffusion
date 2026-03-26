@@ -10,7 +10,7 @@ import math
 EMBEDDING_DIM = 128
 NUM_GROUPS = 32
 NUM_HEADS = 8
-TIME_STAMPS = 1000
+TIME_STEPS = 1000
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # embedding
@@ -102,7 +102,7 @@ class UNETLayer(nn.Module):
         return self.conv(x), x
     
 class UNET(nn.Module):
-    def __init__(self, channels: List, attention: List, num_groups: int=NUM_GROUPS, num_heads: int=NUM_HEADS, dp: float = 0.1, in_channels: int=1, out_channels: int=1, t: int=TIME_STAMPS):
+    def __init__(self, channels: List, attention: List, num_groups: int=NUM_GROUPS, num_heads: int=NUM_HEADS, dp: float = 0.1, in_channels: int=1, out_channels: int=1, t: int=TIME_STEPS):
         super().__init__()
         
         self.num_layers = len(channels)
@@ -146,7 +146,7 @@ class UNET(nn.Module):
 
 # scheduler
 class DDPM_Scheduler(nn.Module):
-    def __init__(self, t: int=TIME_STAMPS, start: float=0.0001, end: float=0.02):
+    def __init__(self, t: int=TIME_STEPS, start: float=0.0001, end: float=0.02):
         super().__init__()
 
         self.beta = torch.linspace(start, end, t, requires_grad=False)
@@ -154,4 +154,3 @@ class DDPM_Scheduler(nn.Module):
 
     def forward(self, t):
         return self.beta[t], self.alpha[t]
-    
