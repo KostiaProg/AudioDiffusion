@@ -1,3 +1,3 @@
-einops
 torch
 timm
+numpy
