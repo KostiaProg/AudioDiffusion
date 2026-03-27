@@ -238,7 +238,6 @@ def train():
     #train_dataset = datasets.MNIST(root='./data', train=True, download=False,transform=transforms.ToTensor())
     train_loader = DataLoader()
 
-    scheduler = model.DDPM_Scheduler(num_time_steps=TIME_STEPS)
     model = UNET().to(device)
 
     lr=0.00002
@@ -310,7 +309,7 @@ def generate():
         for t in reversed(range(TIME_STEPS)):
             t_tensor = torch.as_tensor([t], device=device).long()
             noise_pred = model(xt, t_tensor)
-            xt, x0 = drp.remove_noise(xt, noise_pred, t_tensor)
+            xt = drp.remove_noise(xt, noise_pred, t_tensor)
 
     # postprocess
     xt = torch.clamp(xt, -1., 1.).detach().cpu()
