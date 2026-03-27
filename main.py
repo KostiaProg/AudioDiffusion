@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+import torchaudio
 from torch.utils.data import DataLoader
 
 from pathlib import Path
@@ -27,6 +28,7 @@ WAVE_LENGTH = 16384
 SAMPLE_RATE = 16000
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
 BATCH_SIZE = 16
 MODEL_DIR_PATH = Path("models")
 MODEL_PATH = MODEL_DIR_PATH / "audio_diffusion_1.0.pth"
@@ -231,13 +233,19 @@ def get_saved_model():
     loaded_generator.load_state_dict(torch.load(f=MODEL_PATH, map_location=torch.device(device)))
     return loaded_generator
 
+
+# load dataset
+def load_dataset():
+    data = torchaudio.datasets.COMMONVOICE('.', download=True)
+    dataloader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, num_workers=0 if device=="cpu" else torch.cuda.device_count())
+    
+    return dataloader
+
 # training
 def train():
     torch.seed(67)
 
-    #train_dataset = datasets.MNIST(root='./data', train=True, download=False,transform=transforms.ToTensor())
-    train_loader = DataLoader()
-
+    dataloader = load_dataset()
     model = UNET().to(device)
 
     lr=0.00002
@@ -254,7 +262,7 @@ def train():
         total_loss = 0
 
         model.train()
-        for _, x in enumerate(train_loader, 0):
+        for _, x in enumerate(dataloader, 0):
             x = x.to(device)
             
             # Generate noise and timestamps

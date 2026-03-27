@@ -1,3 +1,4 @@
 torch
 timm
 numpy
+torchaudio
