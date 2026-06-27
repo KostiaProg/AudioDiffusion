@@ -1,326 +1,272 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+from torch import nn, optim
 
-import torchaudio
 from torch.utils.data import DataLoader
+from torchvision import transforms, datasets
 
 from pathlib import Path
 import matplotlib.pyplot as plt
-import math
+import numpy as np
 
-from IPython.display import Audio, display
+WIDTH = 32
+HEIGHT = 16
+BATCH_SIZE = 64
+PIXELS = WIDTH*HEIGHT # 1600x1200 - 32x16
 
-# consts
-EMBEDDING_DIM = 128
-NUM_GROUPS = 8
-NUM_HEADS = 8
-
-NUM_DOWN_LAYERS = 2
-NUM_MID_LAYERS = 2
-NUM_UP_LAYERS = 2
-
-TIME_STEPS = 1000
-SAMPLING_FACTOR = 4
-
-WAVE_LENGTH = 16384
-SAMPLE_RATE = 16000
-
+MODELS_PATH = Path("models")
+DISCRIMINATOR_PATH = MODELS_PATH / "image_discriminator.1.1.pth"
+GENERATOR_PATH = MODELS_PATH / "image_generator.1.1.pth"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-BATCH_SIZE = 16
-MODEL_DIR_PATH = Path("models")
-MODEL_PATH = MODEL_DIR_PATH / "audio_diffusion_1.0.pth"
+COLOR_CHANNELS = 3
+FEATURE_MULTIPLIER = 64
+HIDDEN_DIM = 150
+LABEL_SMOOTHING = 0.8 # 1.0 if no
 
-# embedding
-class SinusoidalEmbeddings(nn.Module):
-    def __init__(self, time_steps:int, embed_dim: int = EMBEDDING_DIM):
-        super().__init__()
+# load data
+def load_data() -> DataLoader:
+    data_path = Path("/root/.cache/kagglehub/datasets/shyambhu/hands-and-palm-images-dataset/versions/2")
+    transform = transforms.Compose([
+        transforms.Resize((HEIGHT, WIDTH)),
+        transforms.RandomVerticalFlip(1.0), # because training dataset is flipped
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
 
-        omega = 1.0 / (10000 ** (torch.arange(0, embed_dim, 2).float() / embed_dim))
-        t = torch.arange(time_steps).unsqueeze(1).float()
+    torch.manual_seed(67)
+    data = datasets.ImageFolder(root=data_path, transform=transform)
+    dataloader = DataLoader(dataset=data, batch_size=BATCH_SIZE, shuffle=True)
 
-        embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
-        embeddings[:, 0::2] = torch.sin(t * omega) # sin/cos(t*w)
-        embeddings[:, 1::2] = torch.cos(t * omega) # odd
-        self.register_buffer('embeddings', embeddings)
-
-    def forward(self, t):
-        return self.embeddings[t].to(device).unsqueeze(-1)
-    
-class TimeEmbedding(nn.Module):
-    def __init__(self, out_channel: int,  t_emb_dim: int=EMBEDDING_DIM):
-        super().__init__()
-        
-        self.te_block = nn.Sequential(
-            nn.SiLU(), 
-            nn.Linear(t_emb_dim, out_channel),
-            nn.SiLU(), 
-            nn.Linear(out_channel, out_channel)
-        )
-        
-    def forward(self, t_emb):
-        return self.te_block(t_emb.transpose(1, 2)).transpose(1, 2)
-
-
-# custom layers
-class NormActConv(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int, num_groups:int = NUM_GROUPS, padding_dilation: int=1):
-        super().__init__()
-        
-        self.conv = nn.Sequential(
-            nn.GroupNorm(num_groups, in_channels),
-            nn.SiLU(),
-            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=padding_dilation, dilation=padding_dilation)
-        )
-        
-    def forward(self, x):
-        return self.conv(x)
-
-class Attention(nn.Module):
-    def __init__(self, num_channels: int, num_groups: int=NUM_GROUPS, num_heads: int=NUM_HEADS):
-        super().__init__()
-        
-        self.g_norm = nn.GroupNorm(num_groups, num_channels)
-        self.attention = nn.MultiheadAttention(num_channels, num_heads, batch_first=True)
-        
-    def forward(self, x):
-        res_x = x
-
-        x = self.g_norm(x).transpose(1, 2) # [B, C, L] -> [B, L, C]
-        x, _ = self.attention(x, x, x)
-        return x.transpose(1, 2) + res_x
-
-# UNET
-class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, t_emb_dim: int=EMBEDDING_DIM, k: int=SAMPLING_FACTOR, downsample: bool = True):
-        super().__init__()
-
-        self.conv1 = NormActConv(in_channels, out_channels)
-        self.conv2 = NormActConv(out_channels, out_channels, padding_dilation=2)
-        self.te_block = TimeEmbedding(out_channels, t_emb_dim)
-        self.attention_block = Attention(out_channels)
-
-        self.res_proj = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
-
-        self.down = nn.Conv1d(out_channels, out_channels, kernel_size=k*2, stride=k, padding=k//2) if downsample else nn.Identity()
-
-    def forward(self, x, t_emb):
-        res = self.res_proj(x)
-
-        x = self.conv1(x)
-        x = x + self.te_block(t_emb)
-        x = self.conv2(x)
-        x = x + res
-
-        x = x + self.attention_block(x)
-    
-        return x, self.down(x) # return x so we add it as a skip connection during upsampling
-    
-class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, t_emb_dim: int=EMBEDDING_DIM, k: int=SAMPLING_FACTOR, upsample: bool = True):
-        super().__init__()
-        
-        self.conv1 = NormActConv(in_channels, out_channels)
-        self.conv2 = NormActConv(out_channels, out_channels, padding_dilation=2)
-        self.te_block = TimeEmbedding(out_channels, t_emb_dim)
-        self.attention_block = Attention(out_channels)
-
-        self.res_proj = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-
-        self.up = nn.Sequential(
-                nn.Upsample(scale_factor=k, mode='nearest'),
-                nn.Conv1d(in_channels, in_channels // 2, kernel_size=3, padding=1)
-            ) if upsample else nn.Identity()
-
-    def forward(self, x, down_out, t_emb):
-        # Upsampling
-        x = self.up(x)
-        if x.shape[-1] != down_out.shape[-1]: # Ensure temporal length matches the skip connection exactly
-            x = F.interpolate(x, size=down_out.shape[-1], mode='linear', align_corners=False)
-        x = torch.cat([x, down_out], dim=1) # skip connection
-
-        res = self.res_proj(x)
-
-        x = self.conv1(x)
-        x = x + self.te_block(t_emb)
-        x = self.conv2(x)
-        x = x + res
-            
-        return self.attention_block(x)
-
-
-class UNET(nn.Module):
-    def __init__(self,
-                 t_emb_dim: int = EMBEDDING_DIM,
-                 t: int = TIME_STEPS,
-                ):
-        super().__init__()
-        
-        self.sin_embedding = SinusoidalEmbeddings(t, t_emb_dim)
-
-        # Initial Convolution
-        self.init_conv = nn.Conv1d(1, 64, kernel_size=7, padding=3)
-        
-        # Down Path
-        self.down1 = DownBlock(64, 128, EMBEDDING_DIM)
-        self.down2 = DownBlock(128, 256, EMBEDDING_DIM)
-        
-        # Mid Block
-        self.mid_conv = NormActConv(256, 256)
-        
-        # Up Path
-        self.up1 = UpBlock(256, 128, EMBEDDING_DIM)
-        self.up2 = UpBlock(128, 64, EMBEDDING_DIM)
-        
-        self.final_conv = nn.Conv1d(64, 1, kernel_size=3, padding=1)
-        
-    def forward(self, x, t):
-        t_emb = self.sin_embedding(t)
-        
-        x = self.init_conv(x)
-        skip1, x = self.down1(x, t_emb)
-        skip2, x = self.down2(x, t_emb)
-        
-        x = self.mid_conv(x)
-        
-        x = self.up1(x, skip2, t_emb)
-        x = self.up2(x, skip1, t_emb)
-        
-        return self.final_conv(x)
-
-
-# add and remove noise
-class DiffusionProcess:
-    def __init__(self, beta_start: float=1e-4, beta_end: float=0.02, t: int=TIME_STEPS):
-
-        self.beta = torch.linspace(beta_start, beta_end, t).to(device)
-        self.alpha = 1. - self.beta
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-        
-    def add_noise(self, x, noise, t):
-        sqrt_alpha_bar = self.alpha_bar[t].sqrt()[:, None, None]
-        sqrt_one_minus_bar = (1. - self.alpha_bar[t]).sqrt()[:, None, None]
-
-        return sqrt_alpha_bar * x + sqrt_one_minus_bar * noise
-    
-    def remove_noise(self, xt, noise_pred, t):
-        a = self.alpha[t][:, None, None]
-        a_bar = self.alpha_bar[t][:, None, None]
-        b = self.beta[t][:, None, None]
-        
-        z = torch.randn_like(xt) if t[0] > 0 else 0 # No noise added at the final step
-            
-        mean = (1/a.sqrt()) * (xt - ( (1-a)/((1-a_bar).sqrt()) ) * noise_pred)
-        sigma = b.sqrt() # Simplest variance schedule
-        return mean + sigma * z
-
-
-# TRAINING CODE
-# save and load model
-def save_model(model):
-    MODEL_DIR_PATH.mkdir(parents=True, exist_ok=True)
-    torch.save(obj=model, f=MODEL_PATH)
-    
-def get_saved_model():
-    loaded_generator = UNET()
-
-    if not MODEL_PATH.is_file():
-        print("First have to train model")
-        train()
-
-    loaded_generator.load_state_dict(torch.load(f=MODEL_PATH, map_location=torch.device(device)))
-    return loaded_generator
-
-
-# load dataset
-def load_dataset():
-    data = torchaudio.datasets.COMMONVOICE('.', download=True)
-    dataloader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, num_workers=0 if device=="cpu" else torch.cuda.device_count())
-    
     return dataloader
 
-# training
-def train():
-    torch.seed(67)
 
-    dataloader = load_dataset()
-    model = UNET().to(device)
+# models
+def weights_init(m): # initialize random weights
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
 
-    lr=0.00002
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+class Discriminator(nn.Module):
+    def __init__(self, feature_multiplier=FEATURE_MULTIPLIER, color_channels=COLOR_CHANNELS):
+        super().__init__()
 
-    dfp = DiffusionProcess()
+        self.hidden1 = nn.Sequential(
+            nn.Conv2d(color_channels, feature_multiplier, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feature_multiplier),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.hidden2 = nn.Sequential(
+            nn.Conv2d(feature_multiplier, feature_multiplier*2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier*2),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.hidden3 = nn.Sequential(
+            nn.Conv2d(feature_multiplier*2, feature_multiplier*4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier*4),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.hidden4 = nn.Sequential(
+            nn.Conv2d(feature_multiplier*4, feature_multiplier*8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier*8),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.out = nn.Conv2d(feature_multiplier*8, 1, (1, 2), 1, 0, bias=False)
 
-    best_eval_loss = float('inf')
-    epochs = 50
-    losses = []
+        self.seq = nn.Sequential(
+            self.hidden1, self.hidden2, self.hidden3, self.hidden4, self.out
+        )
+
+    def forward(self, x):
+        return self.seq(x)
+
+class Generator(nn.Module):
+    def __init__(self, hidden_dim=HIDDEN_DIM, feature_multiplier=FEATURE_MULTIPLIER, color_channels=COLOR_CHANNELS):
+        super().__init__()
+
+        self.hidden1 = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dim, feature_multiplier*8, (1, 2), 1, 0, bias=False),
+            nn.BatchNorm2d(feature_multiplier*8),
+            nn.ReLU(True),
+        )
+        self.hidden2 = nn.Sequential(
+            nn.ConvTranspose2d(feature_multiplier*8, feature_multiplier*4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier*4),
+            nn.ReLU(True),
+        )
+        self.hidden3 = nn.Sequential(
+            nn.ConvTranspose2d(feature_multiplier*4, feature_multiplier*2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier*2),
+            nn.ReLU(True),
+        )
+        self.hidden4 = nn.Sequential(
+            nn.ConvTranspose2d(feature_multiplier*2, feature_multiplier, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feature_multiplier),
+            nn.ReLU(True),
+        )
+        self.out = nn.Sequential(
+            nn.ConvTranspose2d(feature_multiplier, color_channels, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+        self.seq = nn.Sequential(
+            self.hidden1, self.hidden2, self.hidden3, self.hidden4, self.out
+        )
+
+    def forward(self, x):
+        return self.seq(x)
+
+
+# training fns
+def train_discriminator(discriminator, optimizer, loss_fn, real_data, label_smoothing, fake_data, batch_size):
+    # real data
+    pred_real = discriminator(real_data).view(-1)
+    loss_real = loss_fn(pred_real, torch.full_like(pred_real, label_smoothing))
+
+    # fake data
+    pred_fake = discriminator(fake_data).view(-1)
+    loss_fake = loss_fn(pred_fake, torch.zeros_like(pred_fake))
+
+    # accuracy monitoring
+    d_real_acc = (torch.sigmoid(pred_real) > 0.5).float().mean().item()
+    d_fake_acc = (torch.sigmoid(pred_fake) < 0.5).float().mean().item()
+    print(f"  D_real_acc: {d_real_acc:.3f} | D_fake_acc: {d_fake_acc:.3f} | D_loss: {d_loss:.4f}")
+
+    optimizer.zero_grad()
+    (loss_real + loss_fake).backward()
+    optimizer.step()
+
+    return (loss_real + loss_fake).item()
+
+def train_generator(discriminator, optimizer, loss_fn, fake_data, batch_size):
+    pred = discriminator(fake_data).view(-1)
+    loss = loss_fn(pred, torch.ones_like(pred))
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+def train(epochs, dataloader, discriminator, generator, d_optim, g_optim, loss_fn, n_critic):
+    results = { # for plotting
+        "d_loss": [],
+        "g_loss": [],
+    }
+
+    # training
     for epoch in range(epochs):
-        n_batches = 0
-        total_loss = 0
+        epoch_d_loss = 0.0
+        epoch_g_loss = 0.0
+        num_batches = 0
 
-        model.train()
-        for _, x in enumerate(dataloader, 0):
-            x = x.to(device)
-            
-            # Generate noise and timestamps
-            noise = torch.randn_like(x).to(device)
-            t = torch.randint(0, TIME_STEPS, (x.shape[0],)).to(device)
-            
-            # Add noise to the images using Forward Process
-            noisy_imgs = dfp.add_noise(x, noise, t)
-            
-            # Avoid Gradient Accumulation
-            optimizer.zero_grad()
-            
-            # Predict noise using U-net Model
-            noise_pred = model(noisy_imgs, t)
-            
-            # Calculate Loss
-            loss = loss_fn(noise_pred, noise)
-            total_loss += loss.item()
-            
-            # Backprop + Update model params
-            loss.backward()
-            optimizer.step()
+        for n_batch, data in enumerate(dataloader, 0):
+            # discriminator
+            real_data = data[0].to(device)
+            real_data = real_data + torch.randn_like(real_data) * 0.02 # add noise
+            real_data = torch.clamp(real_data, -1.0, 1.0)
 
-            n_batches += 1
-        
-        total_loss /= n_batches
-        losses.append(total_loss)
+            batch_size = real_data.size(0)
 
-        print(f'Epoch: {epoch} | loss: {total_loss}')
-        if total_loss < best_eval_loss:
-            best_eval_loss = total_loss
-            save_model(model)
+            for _ in range(n_critic):
+                noise_d = torch.randn(batch_size, HIDDEN_DIM, 1, 1, device=device)
+                fake_data = generator(noise_d).detach() # detach, so gradients are not calculated for generator
+                d_loss = train_discriminator(discriminator, d_optim, loss_fn, real_data, LABEL_SMOOTHING, fake_data, batch_size)
+                epoch_d_loss += d_loss
 
-    # plot loss curves
-    plt.plot(range(len(losses)), losses)
+            # generator
+            noise_g = torch.randn(batch_size, HIDDEN_DIM, 1, 1, device=device)
+            fake_data = generator(noise_g).to(device)
+            g_loss = train_generator(discriminator, g_optim, loss_fn, fake_data, batch_size)
+            epoch_g_loss += g_loss;
+
+            num_batches += 1
+
+        # save loss and print loss
+        avg_d = epoch_d_loss / num_batches
+        avg_g = epoch_g_loss / num_batches
+        results["d_loss"].append(float(avg_d))
+        results["g_loss"].append(float(avg_g))
+
+        print(f"Discriminator loss: {avg_d} / Generator loss: {avg_g}")
+        print("")
+
+    # plot curves
+    plt.plot(range(len(results["d_loss"])), results["d_loss"], label="Discriminator loss")
+    plt.plot(range(len(results["g_loss"])), results["g_loss"], label="Generator loss")
     plt.title("Loss")
     plt.xlabel("Epochs")
     plt.legend()
     plt.show()
 
+    # save model
+    save_models(discriminator, generator, DISCRIMINATOR_PATH, GENERATOR_PATH)
+
+
+# create and save models
+def save_models(discriminator: nn.Module, generator: nn.Module, discriminator_path: Path, generator_path: Path):
+    MODELS_PATH.mkdir(parents=True, exist_ok=True)
+    torch.save(obj=discriminator.state_dict(), f=discriminator_path)
+    torch.save(obj=generator.state_dict(), f=generator_path)
+
+def create_model():
+    dataloader = load_data()
+
+    # models
+    discriminator = Discriminator().to(device)
+    generator = Generator().to(device)
+
+    # random weights
+    discriminator.apply(weights_init)
+    generator.apply(weights_init)
+
+    # optim and loss
+    d_lr = 0.00005
+    g_lr = 0.0002
+    beta1 = 0.5
+    beta2 = 0.999
+    d_optim = optim.Adam(discriminator.parameters(), lr=d_lr, betas=(beta1, beta2))
+    g_optim = optim.Adam(generator.parameters(), lr=g_lr, betas=(beta1, beta2))
+
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    epochs = 80
+    n_critic = 2
+    train(epochs=epochs, dataloader=dataloader, discriminator=discriminator, generator=generator, d_optim=d_optim, g_optim=g_optim, loss_fn=loss_fn, n_critic=n_critic)
+
+def get_saved_model() -> nn.Module:
+    loaded_generator = Generator()
+
+    if not GENERATOR_PATH.is_file():
+        print("First have to train model")
+        create_model()
+
+    loaded_generator.load_state_dict(torch.load(f=GENERATOR_PATH, map_location=torch.device(device)))
+
+    return loaded_generator
+
 
 # TOO CALL
-def generate():
-    drp = DiffusionProcess()
-    model = get_saved_model()
+def generate_image():
+    generator = get_saved_model().to(device)
+    generator.eval()
 
-    # noise
-    xt = torch.randn(1, 1, WAVE_LENGTH).to(device)
-
-    model.eval()
+    noise = torch.randn(1, HIDDEN_DIM, 1, 1, device=device)
     with torch.inference_mode():
-        for t in reversed(range(TIME_STEPS)):
-            t_tensor = torch.as_tensor([t], device=device).long()
-            noise_pred = model(xt, t_tensor)
-            xt = drp.remove_noise(xt, noise_pred, t_tensor)
+      image = generator(noise)
 
-    # postprocess
-    xt = torch.clamp(xt, -1., 1.).detach().cpu()
+    image = image.detach().cpu()
+    image = image[0].permute(1, 2, 0).numpy() # [64, 128, 3]
 
-    audio_waveform = xt[0, 0].numpy()
-    display(Audio(audio_waveform, rate=SAMPLE_RATE))
+    # Denormalize from [-1, 1] back to [0, 1]
+    image = (image + 1) / 2
+    image = np.clip(image, 0, 1)
+
+    plt.imshow(image)
+    plt.title("Generated image")
+    plt.axis("off")
+    plt.show()
+
+generate_image()
